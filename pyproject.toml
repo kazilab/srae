@@ -1,0 +1,36 @@
+[build-system]
+# >=77 is required by the PEP 639 `license = "MIT"` string form below;
+# earlier setuptools only accepts the `{ text = ... }` table form.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srae"
+dynamic = ["version"]
+description = "Self-Regularizing Additive Estimator: evidence-screened empirical-Bayes additive models with spline main effects and pairwise interactions"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Data Analysis Team @kazilab.se", email = "srae@kazilab.se" }]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "pandas>=1.5",
+    "matplotlib>=3.6",
+    "scikit-learn>=1.2",
+]
+
+[project.optional-dependencies]
+sklearn = ["scikit-learn>=1.2"]
+test = ["pytest>=7", "scikit-learn>=1.2", "pandas>=1.5", "matplotlib>=3.6"]
+benchmark = ["scikit-learn>=1.2", "xgboost>=1.7", "jupyter", "nbformat>=5.7", "nbclient>=0.8", "pytest>=7"]
+
+[tool.setuptools.dynamic]
+version = { attr = "srae._metadata.VERSION" }
+
+[tool.setuptools.packages.find]
+include = ["srae*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
