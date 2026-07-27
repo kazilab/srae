@@ -1,0 +1,3 @@
+# Keeps docs/_static/ tracked by git so Sphinx's html_static_path entry
+# resolves on a fresh clone. Read the Docs builds with fail_on_warning: true,
+# and a missing _static directory raises a warning that fails the build.
