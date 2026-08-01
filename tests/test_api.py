@@ -123,7 +123,15 @@ class TestClassification:
     def test_multiclass_links_match_documented_definitions(
         self, classifier_cls, X, y_mc
     ):
-        """Default is softmax; the opt-in legacy link normalizes OvR heads."""
+        """Each variant must use the link its documentation claims.
+
+        Since 0.0.10 the default is ``joint``: the Laplace posterior of the
+        joint multinomial refit, moderated toward ``1/K``.  The pooled variant
+        overrides the multiclass fit and has no joint analogue, so it falls
+        back to ``normalized_ovr`` -- deliberately, not to ``softmax``, which
+        measured worse on both log-loss and ECE.  The scale-integrated variants
+        keep their own paired-draw route.
+        """
         m = make(classifier_cls).fit(X, y_mc)
 
         def softmax(eta):
@@ -131,24 +139,28 @@ class TestClassification:
             p = np.exp(eta)
             return p / p.sum(axis=1, keepdims=True)
 
-        # SI keeps scale uncertainty by softmaxing paired posterior logit draws.
+        head_prob = np.column_stack([
+            e.predict_proba(X)[:, 1] for e in m.estimators_
+        ])
+        normalized = head_prob / head_prob.sum(axis=1, keepdims=True)
+
         if hasattr(m.estimators_[0], "_si_sample_logits"):
+            # SI keeps scale uncertainty by softmaxing paired posterior draws.
             heads = [e._si_sample_logits(X) for e in m.estimators_]
             n_draws = min(h.shape[0] for h in heads)
             expected = np.mean([
                 softmax(np.column_stack([h[d] for h in heads]))
                 for d in range(n_draws)
             ], axis=0)
+        elif getattr(m, "_joint_", None) is not None:
+            Eta, vbar = m._joint_logits_and_variance(X)
+            expected = softmax(Eta / np.sqrt(1.0 + (np.pi / 8.0) * vbar)[:, None])
         else:
-            expected = softmax(m.decision_function(X))
+            expected = normalized
         assert np.allclose(m.predict_proba(X), expected)
 
         m.multiclass_link = "normalized_ovr"
-        head_prob = np.column_stack([
-            e.predict_proba(X)[:, 1] for e in m.estimators_
-        ])
-        expected_legacy = head_prob / head_prob.sum(axis=1, keepdims=True)
-        assert np.allclose(m.predict_proba(X), expected_legacy)
+        assert np.allclose(m.predict_proba(X), normalized)
 
     def test_binary_has_no_sub_estimators(self, classifier_cls, X, y_bin):
         m = make(classifier_cls).fit(X, y_bin)
@@ -548,6 +560,707 @@ class TestTensorPurification:
         Bj = tb._marginal(xj, fit=False)
         resid = Bj - T @ np.linalg.lstsq(T, Bj, rcond=None)[0]
         assert np.all(resid.std(axis=0) > 1e-8)
+
+
+# --------------------------------------------------------------------------
+# Joint multinomial multiclass
+# --------------------------------------------------------------------------
+
+class TestJointMultinomial:
+    """The multiclass posterior must be joint, not a stack of binary fits.
+
+    Independent one-vs-rest fits leave the cross-class blocks of the Hessian at
+    zero, so they carry no covariance between class surfaces and no neutral
+    point to moderate toward.  0.0.10 refits the discovered structure under one
+    softmax likelihood, which supplies both.
+    """
+
+    @staticmethod
+    def _data(n=300, K=4, seed=0):
+        rng = np.random.default_rng(seed)
+        X = rng.normal(size=(n, 4))
+        lg = np.column_stack([1.2 * np.sin(1.3 * X[:, 0] + c)
+                              + 0.7 * X[:, 2] for c in range(K)])
+        p = np.exp(lg - lg.max(1, keepdims=True))
+        p /= p.sum(1, keepdims=True)
+        y = np.array([rng.choice(K, p=pi) for pi in p])
+        return X, y
+
+    def test_engine_reduces_to_the_logistic_engine_at_two_classes(self):
+        """The strongest available check: at K=2 the multinomial model *is*
+        the logistic one, so both engines must agree bit for bit."""
+        from srae.inference import BlockSpec, fit_logistic_eb, fit_multinomial_eb
+
+        rng = np.random.default_rng(0)
+        n = 300
+        Z = np.column_stack([np.ones(n), rng.normal(size=(n, 3))])
+        eta = Z @ np.array([0.2, 1.0, -0.7, 0.5])
+        y = (rng.uniform(size=n) < 1 / (1 + np.exp(-eta))).astype(float)
+        s = np.array([0.0, 1.0, 1.0, 1.0])
+
+        mn = fit_multinomial_eb(Z, np.column_stack([1 - y, y]),
+                                [BlockSpec("f", slice(0, 4), s)],
+                                max_iter=300, tol=1e-11)
+        lg = fit_logistic_eb(Z, y, [BlockSpec("f", slice(0, 4), s)],
+                             max_iter=300, tol=1e-11)
+        assert mn["evidence"] == pytest.approx(lg["evidence"], abs=1e-8)
+        assert mn["edf"]["f"] == pytest.approx(lg["edf"]["f"], rel=1e-8)
+
+        # Coefficients live in the sum-to-zero contrast basis, so they carry a
+        # fixed scale factor (sqrt(2) at K=2). The invariant quantity is the
+        # logit contrast the model actually predicts with.
+        C = mn["contrasts"]
+        contrast = float(C[1, 0] - C[0, 0]) * mn["beta"][0]
+        assert np.abs(contrast - lg["beta"]).max() < 1e-8
+
+    def test_gradient_and_hessian_match_finite_differences(self):
+        """Guards the analytic derivatives that the Newton solve depends on."""
+        from srae.inference import (_contrast_basis, _multinomial_hessian,
+                                    _softmax_rows)
+
+        rng = np.random.default_rng(0)
+        n, p, K = 150, 5, 4
+        Z = np.column_stack([np.ones(n), rng.normal(size=(n, p - 1))])
+        C = _contrast_basis(K)
+        P0 = _softmax_rows(Z @ (rng.normal(size=(K - 1, p)) * 0.8).T @ C.T)
+        y = np.array([rng.choice(K, p=pi) for pi in P0])
+        Y = np.eye(K)[y]
+        a = np.full((K - 1) * p, 0.7)
+
+        def grad(b):
+            Q = _softmax_rows(Z @ b.reshape(K - 1, p).T @ C.T)
+            return (C.T @ ((Y - Q).T @ Z)).ravel() - a * b
+
+        b0 = rng.normal(size=(K - 1) * p) * 0.3
+        P = _softmax_rows(Z @ b0.reshape(K - 1, p).T @ C.T)
+        H = _multinomial_hessian(Z, P, C, a, K - 1)
+        step = 1e-6 * np.eye(len(b0))
+        Hfd = np.column_stack([(grad(b0 + e) - grad(b0 - e)) / 2e-6
+                               for e in step])
+        assert np.abs(H + Hfd).max() < 1e-5 * np.abs(H).max()
+
+    def test_fit_exposes_a_joint_posterior(self):
+        """``joint_`` carries K-1 contrasts against a reference class."""
+        from srae import SRAEClassifier
+
+        X, y = self._data()
+        m = SRAEClassifier(interactions=False, n_knots=6).fit(X, y)
+        K = len(m.classes_)
+        assert m.joint_["beta"].shape[0] == K - 1
+        C = m.joint_["contrasts"]
+        assert C.shape == (K, K - 1)
+        assert np.allclose(C.T @ C, np.eye(K - 1), atol=1e-10)   # orthonormal
+        assert np.abs(C.sum(axis=0)).max() < 1e-10               # sum-to-zero
+        p = m.joint_["beta"].shape[1]
+        assert m.joint_["Sigma"].shape == ((K - 1) * p,) * 2
+        # the cross-class blocks are what one-vs-rest cannot produce
+        off = m.joint_["Sigma"][:p, p:2 * p]
+        assert np.abs(off).max() > 0
+
+    def test_probabilities_are_moderated_toward_uniform(self):
+        """Moderation must pull toward 1/K, never past it or away from it."""
+        from srae import SRAEClassifier
+
+        X, y = self._data()
+        m = SRAEClassifier(interactions=False, n_knots=6).fit(X, y)
+        K = len(m.classes_)
+        P = m.predict_proba(X)
+        assert np.allclose(P.sum(1), 1.0)
+
+        Eta, vbar = m._joint_logits_and_variance(X)
+        assert np.all(vbar >= 0)
+        unmoderated = np.exp(Eta - Eta.max(1, keepdims=True))
+        unmoderated /= unmoderated.sum(1, keepdims=True)
+        # every row is at least as close to uniform as the unmoderated one
+        d_mod = np.abs(P - 1.0 / K).sum(1)
+        d_raw = np.abs(unmoderated - 1.0 / K).sum(1)
+        assert np.all(d_mod <= d_raw + 1e-9)
+
+    def test_moderation_is_independent_of_the_reference_class(self):
+        """A common per-row factor keeps the link reference-invariant.
+
+        Scaling every logit by one number commutes with the constant shift that
+        relabelling the reference introduces, which a per-class factor would
+        not.  Checked by relabelling the classes cyclically and refitting.
+        """
+        from srae import SRAEClassifier
+
+        X, y = self._data()
+        base = SRAEClassifier(interactions=False, n_knots=6).fit(X, y)
+        K = len(base.classes_)
+        rolled = SRAEClassifier(interactions=False, n_knots=6).fit(X, (y + 1) % K)
+        # rolled label j corresponds to original class j-1, so undo by taking
+        # column (c+1) % K for original class c.
+        P0 = base.predict_proba(X)
+        P1 = rolled.predict_proba(X)[:, (np.arange(K) + 1) % K]
+        assert np.abs(P0 - P1).max() < 1e-6
+
+    def test_legacy_links_remain_reproducible(self):
+        """Both retired routes stay available for published results."""
+        from srae import SRAEClassifier
+
+        class Softmax(SRAEClassifier):
+            multiclass_link = "softmax"
+
+        class NormOvR(SRAEClassifier):
+            multiclass_link = "normalized_ovr"
+
+        X, y = self._data()
+        kw = dict(interactions=False, n_knots=6)
+        Pj = SRAEClassifier(**kw).fit(X, y).predict_proba(X)
+        Ps = Softmax(**kw).fit(X, y).predict_proba(X)
+        Pn = NormOvR(**kw).fit(X, y).predict_proba(X)
+        for P in (Pj, Ps, Pn):
+            assert np.allclose(P.sum(1), 1.0)
+        assert np.abs(Pj - Ps).max() > 1e-3
+        assert np.abs(Pj - Pn).max() > 1e-3
+
+    def test_binary_path_is_untouched(self):
+        """K = 2 must not acquire a joint fit or change behaviour."""
+        from srae import SRAEClassifier
+
+        X, y = self._data()
+        m = SRAEClassifier(interactions=False, n_knots=6).fit(X, (y > 1).astype(int))
+        assert m.estimators_ is None
+        assert not hasattr(m, "joint_")
+        assert np.allclose(m.predict_proba(X).sum(1), 1.0)
+
+    def test_oversized_problems_decline_the_joint_fit_and_say_so(self):
+        """The Hessian is ((K-1) * n_columns) square, so it must be bounded.
+
+        sklearn's ``check_estimator`` fits a 200-class problem that would ask
+        for a 14129-square Hessian -- 1.6 GB per matrix, and enough of them to
+        be OOM-killed. Declining must leave a working model on the legacy link
+        and warn, not raise and not silently degrade.
+        """
+        import srae.model as model_mod
+        from srae import SRAEClassifier
+
+        X, y = self._data(n=200)
+        original = model_mod._MAX_JOINT_DIM
+        try:
+            model_mod._MAX_JOINT_DIM = 4        # force the limit
+            with pytest.warns(RuntimeWarning, match="joint multinomial refit"):
+                m = SRAEClassifier(interactions=False, n_knots=5).fit(X, y)
+        finally:
+            model_mod._MAX_JOINT_DIM = original
+
+        assert getattr(m, "_joint_", None) is None
+        P = m.predict_proba(X)
+        assert np.allclose(P.sum(1), 1.0)
+        ref = np.column_stack([e.predict_proba(X)[:, 1] for e in m.estimators_])
+        assert np.allclose(P, ref / ref.sum(1, keepdims=True))
+
+    def test_variants_without_a_joint_fit_fall_back_to_normalized_ovr(self):
+        """Pooled / SI override the multiclass fit and have no joint analogue.
+
+        Their fallback must be ``normalized_ovr``, the better-calibrated of the
+        two legacy routes, not the ``softmax`` it replaced.
+        """
+        from srae import SRAEClassifierPooled
+
+        X, y = self._data(n=200)
+        m = SRAEClassifierPooled(interactions=False, n_knots=5).fit(X, y)
+        assert getattr(m, "_joint_", None) is None
+        P = m.predict_proba(X)
+        ref = np.column_stack([e.predict_proba(X)[:, 1] for e in m.estimators_])
+        assert np.allclose(P, ref / ref.sum(1, keepdims=True))
+
+
+# --------------------------------------------------------------------------
+# Spline roughness penalty
+# --------------------------------------------------------------------------
+
+class TestRoughnessPenalty:
+    """The penalty must be the integral it claims to be, on any knot spacing.
+
+    SRAE places knots at empirical quantiles, so the plain coefficient
+    difference penalty of Eilers and Marx -- formulated for equally spaced
+    knots -- does not represent a roughness measure here.  0.0.7 replaced it
+    with the exact integrated squared second derivative.
+    """
+
+    @staticmethod
+    def _skewed(n=300, seed=0):
+        """Gamma-distributed x: quantile knots come out strongly non-uniform."""
+        rng = np.random.default_rng(seed)
+        x = np.sort(rng.gamma(2.0, 1.0, n))
+        y = np.sin(1.2 * x) + rng.normal(0, 0.2, n)
+        return x, y - y.mean()
+
+    def test_quadratic_form_is_the_exact_integral(self):
+        """beta' Omega beta == integral (f'')^2 dx, checked against quadrature."""
+        from scipy.integrate import quad
+        from scipy.interpolate import BSpline
+
+        from srae.blocks import SplineBlock, _integral_derivative_penalty
+
+        x, _ = self._skewed()
+        blk = SplineBlock(n_knots=10)
+        blk.fit(x)
+        t, k = blk.t_, blk.degree
+        Om = _integral_derivative_penalty(t, k, order=2)
+
+        rng = np.random.default_rng(1)
+        for _ in range(3):
+            c = rng.normal(size=len(t) - k - 1)
+            exact = quad(lambda u: BSpline(t, c, k).derivative(2)(u) ** 2,
+                         t[k], t[-k - 1], limit=400)[0]
+            assert abs(float(c @ Om @ c) - exact) < 1e-6 * abs(exact)
+
+    def test_knots_are_non_uniform_enough_to_matter(self):
+        """Guards the premise: on quantile knots the spacing really does vary."""
+        from srae.blocks import SplineBlock
+
+        x, _ = self._skewed()
+        blk = SplineBlock(n_knots=10)
+        blk.fit(x)
+        spacing = np.diff(blk.t_[blk.degree:-blk.degree])
+        assert spacing.max() / spacing.min() > 10
+
+    def test_null_space_is_exactly_the_straight_lines(self):
+        """Order-2 roughness annihilates linear functions and nothing else.
+
+        Under the difference penalty on quantile knots the null space was only
+        *trend-like*, which is what forced the hedged wording about ``kappa_j``
+        in the docs before 0.0.7.
+        """
+        from srae.blocks import (SplineBlock, _bspline_design,
+                                 _integral_derivative_penalty)
+
+        x, _ = self._skewed()
+        blk = SplineBlock(n_knots=10)
+        blk.fit(x)
+        Om = _integral_derivative_penalty(blk.t_, blk.degree, order=2)
+        w, V = np.linalg.eigh(Om)
+        null = V[:, w < 1e-8 * w.max()]
+        assert null.shape[1] == 2
+
+        grid = np.linspace(blk.t_[blk.degree], blk.t_[-blk.degree - 1], 400)
+        basis = _bspline_design(grid, blk.t_, blk.degree)
+        line = np.column_stack([np.ones_like(grid), grid])
+        for i in range(null.shape[1]):
+            f = basis @ null[:, i]
+            resid = f - line @ np.linalg.lstsq(line, f, rcond=None)[0]
+            assert np.abs(resid).max() < 1e-9 * max(f.max() - f.min(), 1e-12)
+
+    @pytest.mark.parametrize("dist", ["uniform", "normal", "gamma", "lognormal"])
+    def test_null_space_is_one_canonical_column(self, dist):
+        """One zero-penalty column, not two collinear ones.
+
+        The order-2 penalty annihilates a two-dimensional space, but centering
+        removes the constant fitted contribution, so exactly one function
+        survives.  An eigensolver returns an arbitrary mixture of the two
+        zero-eigenvalue vectors -- in practice always one leaving both columns
+        non-constant -- so before 0.0.9 the block kept two perfectly collinear
+        columns for that single function and reported ``n_coef`` one too high.
+        """
+        from srae.blocks import SplineBlock
+
+        rng = np.random.default_rng(0)
+        n = 300
+        x = np.sort({"uniform": lambda: rng.uniform(0, 6, n),
+                     "normal": lambda: rng.normal(3, 1, n),
+                     "gamma": lambda: rng.gamma(2.0, 1.0, n),
+                     "lognormal": lambda: rng.lognormal(0.4, 0.9, n)}[dist]())
+
+        blk = SplineBlock(n_knots=10)
+        Z = blk.fit(x)
+        assert int(np.sum(blk.s_ == 0)) == 1
+        assert Z.shape[1] == blk.s_.size
+
+        # and no two columns are collinear
+        C = np.corrcoef(Z.T)
+        np.fill_diagonal(C, 0.0)
+        assert np.abs(C).max() < 1.0 - 1e-6
+
+    def test_canonicalizing_the_null_space_changes_no_fitted_quantity(self):
+        """It is a representation change: only ``n_coef`` and ``kappa`` move.
+
+        Two collinear coordinates sharing an isotropic ``kappa_j`` telescope to
+        the same EM fixed point as one, so evidence, edf and the fitted
+        function are untouched.  Compared here against the redundant
+        parametrization built by hand.
+        """
+        from scipy.linalg import eigh
+
+        from srae.blocks import SplineBlock, _bspline_design
+        from srae.inference import BlockSpec, fit_gaussian_eb
+
+        x, y = self._skewed()
+        blk = SplineBlock(n_knots=10)
+        Z = blk.fit(x)
+
+        # rebuild without the canonicalization: rotate, then filter on norms
+        B = _bspline_design(x, blk.t_, blk.degree)
+        Bc = B - B.mean(axis=0)
+        s, U = eigh(blk._penalty_matrix(B.shape[1]))
+        s = np.clip(s, 0.0, None) / max(np.clip(s, 0.0, None).max(), 1e-300)
+        s[s < 1e-10] = 0.0
+        Zt = Bc @ U
+        nr = np.linalg.norm(Zt, axis=0)
+        keep = nr > 1e-8 * nr.max()
+        Zt, s_red = Zt[:, keep], s[keep]
+        sc = Zt.std(axis=0)
+        sc[sc < 1e-12] = 1.0
+        Zred, s_red = Zt / sc, s_red / sc**2
+
+        assert Zred.shape[1] == Z.shape[1] + 1      # the redundant column
+        assert int(np.sum(s_red == 0)) == 2
+
+        def run(Zx, sx):
+            b = [BlockSpec("f", slice(0, Zx.shape[1]), sx)]
+            o = fit_gaussian_eb(Zx, y, b, max_iter=800, tol=1e-11)
+            return o["evidence"], o["edf"]["f"], b[0].lam, Zx @ o["beta"]
+
+        # Tolerances reflect the EM stopping rule, not the identity: the two
+        # parametrizations have different coordinate counts, so EM halts at
+        # marginally different points and the small difference in lambda
+        # propagates to edf. Measured residuals are ~1e-3 nats of evidence --
+        # against a 4.0-nat selection threshold -- and ~2e-4 relative on edf.
+        new, old = run(Z, blk.s_), run(Zred, s_red)
+        assert new[0] == pytest.approx(old[0], abs=5e-3)      # evidence, nats
+        assert new[1] == pytest.approx(old[1], rel=1e-3)      # edf
+        assert new[2] == pytest.approx(old[2], rel=1e-3)      # lambda
+        assert np.abs(new[3] - old[3]).max() < 1e-3           # fitted values
+
+    def test_kappa_direction_is_linear_in_raw_x(self):
+        """The consequence users see: unpenalized columns are straight lines."""
+        from srae.blocks import SplineBlock
+
+        x, _ = self._skewed()
+        blk = SplineBlock(n_knots=10)
+        Z = blk.fit(x)
+        line = np.column_stack([np.ones_like(x), x])
+        unpenalized = np.where(blk.s_ == 0)[0]
+        assert len(unpenalized) >= 1
+        for i in unpenalized:
+            z = Z[:, i]
+            resid = z - line @ np.linalg.lstsq(line, z, rcond=None)[0]
+            assert np.abs(resid).max() < 1e-8 * (z.max() - z.min())
+
+    def test_integral_penalty_beats_differences_on_skewed_knots(self):
+        """Why the default changed, pinned as a measurement.
+
+        Same basis, same data, same engine -- only the penalty differs.  The
+        difference penalty under-penalizes curvature where knots are dense, so
+        it buys a worse marginal likelihood while spending more edf.
+        """
+        from srae.blocks import SplineBlock
+        from srae.inference import BlockSpec, fit_gaussian_eb
+
+        class Legacy(SplineBlock):
+            penalty = "difference"
+
+        x, y = self._skewed()
+
+        def run(cls):
+            blk = cls(n_knots=10)
+            Z = blk.fit(x)
+            b = [BlockSpec("f", slice(0, Z.shape[1]), blk.s_)]
+            out = fit_gaussian_eb(Z, y, b, max_iter=800, tol=1e-11)
+            return out["evidence"], out["edf"]["f"]
+
+        ev_new, edf_new = run(SplineBlock)
+        ev_old, edf_old = run(Legacy)
+        assert ev_new > ev_old + 5.0
+        assert edf_new < edf_old
+
+    @pytest.mark.parametrize("scale", [1e-4, 1e-2, 1e2, 1e4])
+    def test_fit_is_invariant_to_the_units_of_x(self, scale):
+        """Rescaling a feature must not change anything at all.
+
+        The roughness penalty carries units of ``x**-3``, so its eigenvalues
+        move by nine orders of magnitude between millimetres and metres. The
+        block normalizes them for exactly this reason: without it the EM update
+        for ``lambda`` -- which starts at 1 -- lands in a degenerate fixed point
+        where the prior already dominates, the update returns ``lambda``
+        unchanged, and the component collapses to a straight line no matter
+        what the data says.
+        """
+        from srae import SRAERegressor
+
+        rng = np.random.default_rng(0)
+        n = 400
+        x = rng.normal(size=n)
+        y = np.sin(1.5 * x) + rng.normal(0, 0.25, n)
+
+        base = SRAERegressor(interactions=False).fit(x.reshape(-1, 1), y)
+        moved = SRAERegressor(interactions=False).fit((scale * x).reshape(-1, 1), y)
+        b, m = base.summary().iloc[0], moved.summary().iloc[0]
+
+        assert m["edf"] == pytest.approx(b["edf"], rel=1e-6)
+        assert m["lam"] == pytest.approx(b["lam"], rel=1e-6)
+        assert m["kappa"] == pytest.approx(b["kappa"], rel=1e-6)
+        assert moved.evidence_ == pytest.approx(base.evidence_, rel=1e-9)
+
+    def test_difference_penalty_escape_hatch_restores_old_design(self):
+        """``penalty='difference'`` must reproduce the pre-0.0.7 construction."""
+        from srae.blocks import (SplineBlock, _difference_penalty,
+                                 _integral_derivative_penalty)
+
+        class Legacy(SplineBlock):
+            penalty = "difference"
+
+        x, _ = self._skewed()
+        legacy, current = Legacy(n_knots=10), SplineBlock(n_knots=10)
+        legacy.fit(x)
+        current.fit(x)
+        n_basis = len(legacy.t_) - legacy.degree - 1
+
+        assert np.allclose(legacy._penalty_matrix(n_basis),
+                           _difference_penalty(n_basis, order=2))
+        assert np.allclose(
+            current._penalty_matrix(n_basis),
+            _integral_derivative_penalty(current.t_, current.degree, order=2))
+        # The two knot vectors are identical, so any difference is the penalty.
+        assert np.allclose(legacy.t_, current.t_)
+        assert not np.allclose(legacy._penalty_matrix(n_basis),
+                               current._penalty_matrix(n_basis))
+
+
+# --------------------------------------------------------------------------
+# Tensor blocks: basis invariance of the screening gain
+# --------------------------------------------------------------------------
+
+class TestTensorPenalty:
+    """The screening gain must depend on the surface, not on its coordinates.
+
+    Before 0.0.8 the tensor block carried an isotropic ridge on B-spline
+    coefficients.  A ridge is not a functional of the fitted surface, so
+    reparametrizing the marginals over the same function space moved the gain
+    -- by more than the 4.0-nat selection threshold in the worst case measured.
+    0.0.8 replaced it with the integrated squared second derivatives of the
+    surface, which is such a functional and therefore transforms correctly.
+    """
+
+    @staticmethod
+    def _setup(seed=0, n=400):
+        from srae.blocks import SplineBlock
+
+        rng = np.random.default_rng(seed)
+        X = rng.normal(size=(n, 2))
+        y = 2.0 * X[:, 0] * X[:, 1] + np.sin(1.5 * X[:, 0]) + rng.normal(0, 0.3, n)
+        main = np.column_stack(
+            [SplineBlock(n_knots=10).fit(X[:, j]) for j in range(2)]
+        )
+        return X, y - y.mean(), main
+
+    @staticmethod
+    def _run(X, y, main, rule, W=None, R=None, S=None):
+        """Build the block by hand so the marginal basis can be swapped.
+
+        ``rule`` selects which penalty is applied *in the coordinates actually
+        used*: a ridge is the identity whatever the basis, while the roughness
+        penalty of the same surfaces expressed through ``B R`` is
+        ``(R kron S)' Omega (R kron S)``.
+        """
+        from srae.blocks import TensorBlock
+        from srae.inference import BlockSpec, fit_gaussian_eb
+
+        n = len(X)
+        tb = TensorBlock(pair=(0, 1))
+        tb._ts = []
+        Bj = tb._marginal(X[:, 0], fit=True, side=0)
+        Bk = tb._marginal(X[:, 1], fit=True, side=1)
+        Om = tb._penalty_matrix(Bj.shape[1], Bk.shape[1])
+        T = np.einsum("ij,ik->ijk", Bj, Bk).reshape(n, -1)
+        if W is not None:
+            T, Bj, Bk = T @ W, Bj @ R, Bk @ S
+            Om = W.T @ Om @ W if rule == "roughness" else np.eye(T.shape[1])
+        elif rule == "ridge":
+            Om = np.eye(T.shape[1])
+
+        P = tb._purify_design(Bj, Bk, main)
+        Tp = T - P @ np.linalg.lstsq(P, T, rcond=None)[0]
+        s, U = np.linalg.eigh(Om)
+        s = np.clip(s, 0.0, None)
+        keep = s > 1e-9 * s.max()
+        Z, s = (Tp @ U)[:, keep], s[keep] / s[keep].max()
+        sc = Z.std(axis=0)
+        sc[sc < 1e-12] = 1.0
+        blocks = [BlockSpec("t", slice(0, int(keep.sum())), s / sc**2)]
+        out = fit_gaussian_eb(Z / sc, y, blocks, max_iter=1200, tol=1e-12)
+        return out["evidence"], out["edf"]["t"], int(keep.sum())
+
+    @staticmethod
+    def _reparam(rng, p=5, q=5):
+        R = np.eye(p) + 0.4 * rng.normal(size=(p, p))
+        S = np.eye(q) + 0.4 * rng.normal(size=(q, q))
+        return np.kron(R, S), R, S
+
+    def test_penalty_is_the_exact_double_integral(self):
+        """Check the Kronecker form against a dense independent quadrature."""
+        from scipy.interpolate import BSpline
+
+        from srae.blocks import (TensorBlock, _derivative_coef_operator,
+                                 _marginal_penalty_parts,
+                                 _tensor_roughness_penalty)
+
+        rng = np.random.default_rng(0)
+        tb = TensorBlock(pair=(0, 1))
+        tb._ts = []
+        Bj = tb._marginal(rng.normal(size=300), fit=True, side=0)
+        Bk = tb._marginal(rng.normal(size=300), fit=True, side=1)
+        tj, tk, k = tb._ts[0], tb._ts[1], tb.degree
+        p, q = Bj.shape[1], Bk.shape[1]
+        tjn = (tj - tj[0]) / (tj[-1] - tj[0])
+        tkn = (tk - tk[0]) / (tk[-1] - tk[0])
+        Om = _tensor_roughness_penalty(
+            _marginal_penalty_parts(tjn, k, p, False),
+            _marginal_penalty_parts(tkn, k, q, False))
+
+        def design(t, order, grid):
+            if order == 0:
+                return BSpline.design_matrix(grid, t, k).toarray()
+            D, t2, k2 = _derivative_coef_operator(t, k, order)
+            return BSpline.design_matrix(grid, t2, k2).toarray() @ D
+
+        gu = np.linspace(tjn[k], tjn[-k - 1], 1201)
+        gv = np.linspace(tkn[k], tkn[-k - 1], 1201)
+        Aj = [design(tjn, d, gu) for d in (0, 1, 2)]
+        Ak = [design(tkn, d, gv) for d in (0, 1, 2)]
+        for _ in range(2):
+            c = rng.normal(size=p * q)
+            M = c.reshape(p, q)
+            F = ((Aj[2] @ M @ Ak[0].T) ** 2 + 2 * (Aj[1] @ M @ Ak[1].T) ** 2
+                 + (Aj[0] @ M @ Ak[2].T) ** 2)
+            grid = np.trapezoid(np.trapezoid(F, gv, axis=1), gu)
+            assert abs(float(c @ Om @ c) - grid) < 5e-3 * abs(grid)
+
+    def test_null_space_is_the_affine_surfaces(self):
+        """Order-2 roughness annihilates ``a + b x_j + c x_k`` and nothing more.
+
+        The bilinear ``x_j x_k`` must *not* be in it -- it is the simplest
+        genuine interaction, and the mixed-derivative term is what penalizes it.
+        """
+        from srae.blocks import (TensorBlock, _marginal_penalty_parts,
+                                 _tensor_roughness_penalty)
+
+        tb = TensorBlock(pair=(0, 1))
+        tb._ts = []
+        rng = np.random.default_rng(0)
+        tb._marginal(rng.normal(size=300), fit=True, side=0)
+        tb._marginal(rng.normal(size=300), fit=True, side=1)
+        norm = [(t - t[0]) / (t[-1] - t[0]) for t in tb._ts]
+        Om = _tensor_roughness_penalty(
+            *[_marginal_penalty_parts(t, tb.degree, 5, False) for t in norm])
+
+        w = np.linalg.eigvalsh(Om)
+        assert int(np.sum(w <= 1e-9 * w.max())) == 3      # 1, x_j, x_k
+
+        # the bilinear surface, in coefficients: linear in each margin
+        from srae.blocks import _bspline_design
+        cs = []
+        for t in norm:
+            g = np.linspace(t[tb.degree], t[-tb.degree - 1], 200)
+            cs.append(np.linalg.lstsq(_bspline_design(g, t, tb.degree),
+                                      g, rcond=None)[0])
+        bilinear = np.kron(cs[0], cs[1])
+        assert float(bilinear @ Om @ bilinear) > 1e-6
+
+    def test_gain_is_invariant_to_the_marginal_basis(self):
+        """The property 0.0.8 exists to provide."""
+        X, y, main = self._setup()
+        W, R, S = self._reparam(np.random.default_rng(0))
+        base = self._run(X, y, main, "roughness")
+        moved = self._run(X, y, main, "roughness", W, R, S)
+        assert moved[2] == base[2]                       # same column count
+        assert abs(moved[0] - base[0]) < 1e-6            # evidence, in nats
+        # edf carries the EM stopping tolerance rather than an exact identity.
+        assert abs(moved[1] - base[1]) < 1e-4
+
+    def test_ridge_was_not_invariant(self):
+        """Characterizes what was replaced, so the contrast cannot rot."""
+        X, y, main = self._setup()
+        W, R, S = self._reparam(np.random.default_rng(0))
+        base = self._run(X, y, main, "ridge")
+        moved = self._run(X, y, main, "ridge", W, R, S)
+        assert abs(moved[0] - base[0]) > 0.5
+
+    def test_design_is_rank_deficient_but_penalty_null_space_is_dropped(self):
+        """22 columns of design rank 16.
+
+        Purification removes ``span[1, B_j, B_k]``, nine dimensions of the
+        tensor's own column space. Three of those are the penalty's affine null
+        space and are dropped outright -- keeping them would hand the zero
+        function to ``kappa_j`` and break the invariance above. The remaining
+        six are penalized but unidentified, contributing nothing to ``edf``
+        because they lie in the null space of the design's Gram.
+        """
+        from srae.blocks import SplineBlock, TensorBlock
+
+        X, y, main = self._setup()
+        tb = TensorBlock(pair=(0, 1))
+        Z = tb.fit(X[:, 0], X[:, 1], main)
+        sv = np.linalg.svd(Z, compute_uv=False)
+        assert Z.shape[1] == 22
+        assert int(np.sum(sv > 1e-8 * sv[0])) == 16
+        assert np.all(tb.s_ > 0)                 # no kappa direction remains
+
+        from srae.inference import BlockSpec, fit_gaussian_eb
+        blocks = [BlockSpec("t", slice(0, Z.shape[1]), tb.s_)]
+        out = fit_gaussian_eb(Z, y, blocks, max_iter=800, tol=1e-11)
+        assert out["edf"]["t"] < 16 + 1e-6       # bounded by the design rank
+
+    def test_transform_round_trips_the_training_design(self):
+        """``transform`` must reproduce ``fit`` on the training rows."""
+        from srae.blocks import TensorBlock
+
+        X, _, main = self._setup()
+        tb = TensorBlock(pair=(0, 1))
+        Z = tb.fit(X[:, 0], X[:, 1], main)
+        assert np.allclose(tb.transform(X[:, 0], X[:, 1], main), Z, atol=1e-10)
+
+    @pytest.mark.parametrize("scale", [1e-3, 1e-1, 1e1, 1e3])
+    def test_gain_is_invariant_to_the_units_of_the_margins(self, scale):
+        """Including *differential* scaling of the two margins.
+
+        The three Kronecker terms carry different powers of the domain length,
+        so an isotropic thin-plate penalty on raw knots would reweight them as
+        a feature was re-expressed in other units. Rescaling each margin's
+        knots to [0, 1] is what removes that.
+        """
+        from srae import SRAERegressor
+
+        rng = np.random.default_rng(0)
+        n = 400
+        X = rng.normal(size=(n, 3))
+        y = (2.0 * X[:, 0] * X[:, 1] + np.sin(1.5 * X[:, 2])
+             + rng.normal(0, 0.3, n))
+
+        def run(Xs):
+            m = SRAERegressor(interactions="auto").fit(Xs, y)
+            gain = [d["screen_gain"] for d in m.interactions_
+                    if d["name"] == "x0*x1"]
+            return m.evidence_, (gain[0] if gain else None)
+
+        Xm = X.copy()
+        Xm[:, 0] *= scale
+        Xm[:, 1] *= scale / 3.0            # margins scaled differently
+        base_ev, base_gain = run(X)
+        moved_ev, moved_gain = run(Xm)
+
+        assert base_gain is not None and moved_gain is not None
+        assert moved_ev == pytest.approx(base_ev, rel=1e-9)
+        assert moved_gain == pytest.approx(base_gain, rel=1e-6)
+
+    def test_ridge_escape_hatch(self):
+        """``penalty='ridge'`` restores the pre-0.0.8 construction."""
+        from srae.blocks import TensorBlock
+
+        class Legacy(TensorBlock):
+            penalty = "ridge"
+
+        X, _, main = self._setup()
+        legacy = Legacy(pair=(0, 1))
+        legacy.fit(X[:, 0], X[:, 1], main)
+        assert np.allclose(legacy._penalty_matrix(5, 5), np.eye(25))
+        assert TensorBlock.penalty == "roughness"
+
+        current = TensorBlock(pair=(0, 1))
+        current.fit(X[:, 0], X[:, 1], main)
+        assert not np.allclose(current._penalty_matrix(5, 5), np.eye(25))
 
 
 # --------------------------------------------------------------------------
