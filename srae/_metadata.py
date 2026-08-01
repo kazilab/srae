@@ -3,7 +3,7 @@
 
 PROJECT_NAME = "SRAE"
 FULL_NAME = "Self-Regularizing Additive Estimator"
-VERSION = "0.0.6"
+VERSION = "0.0.10"
 
 # Credited author: shown in the docs and in the package metadata.
 AUTHOR = "Data Analysis Team @kazilab.se"

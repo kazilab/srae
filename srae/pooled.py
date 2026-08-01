@@ -1069,11 +1069,11 @@ class SRAERegressorPooled(_PooledMixin, SRAERegressor):
 
     Notes
     -----
-    The capacity cap is aggressive. On one :math:`n = 80` synthetic design the
-    Type-II fit reached :math:`R^2 \\approx 0.99` while the pooled fit reached
-    :math:`\\approx 0.53`, despite both selecting the same correct
-    interaction. Verify against :class:`~srae.SRAERegressor` rather than
-    assuming the pooled variant is uniformly safer.
+    The capacity cap is aggressive: on every dataset in
+    ``benchmarks/RESULTS.md`` the pooled stack scored below the plain Type-II
+    estimator. Verify against :class:`~srae.SRAERegressor` rather than assuming
+    the pooled variant is uniformly safer. It was developed for small-sample
+    settings those datasets do not represent.
 
     ``evidence_`` is *not* comparable with the Type-II path. On a fixed design,
     pooling moves away from the unpooled evidence optimum; screening may also

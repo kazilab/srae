@@ -36,10 +36,22 @@ from .blocks import (
     make_block,
     normalize_feature_type,
 )
-from .inference import BlockSpec, fit_gaussian_eb, fit_logistic_eb, _sigmoid
+from .inference import (BlockSpec, fit_gaussian_eb, fit_logistic_eb,
+                        fit_multinomial_eb, _sigmoid)
 
 # Main-effect blocks that own a single input column (not intercept / tensor).
 _MAIN_BLOCKS = (SplineBlock, LinearBlock, FactorBlock)
+
+#: Largest ``(K-1) * n_columns`` for which the joint multinomial refit is
+#: attempted. The Hessian is that square and is factorized inside every EM
+#: step, so time grows as its cube and memory as its square.
+#:
+#: 4000 admits realistic problems -- 10 classes over 40 features is 3249, about
+#: half a minute -- while excluding the degenerate ones. sklearn's
+#: ``check_estimator`` fits a 200-class problem that would ask for a
+#: 14129-square Hessian: 1.6 GB per matrix, and enough of them to be killed by
+#: the OOM reaper. Raise it only if you have measured the fit you want.
+_MAX_JOINT_DIM = 4000
 
 try:
     from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
@@ -405,8 +417,9 @@ class _BaseSRAE(BaseEstimator):
 
         Read ``edf`` together with ``kind``, ``lam`` and ``kappa``. ``edf``
         near 1 means roughly one effective direction remains, not universally
-        a straight line. For a spline with large ``lam`` that direction is
-        trend-like; for factor and tensor blocks it has a different meaning.
+        a straight line. For a spline with large ``lam`` that direction is a
+        straight line in raw ``x``; for factor and tensor blocks it has a
+        different meaning.
         ``edf`` near 0 means the component is effectively switched off, while
         spline ``edf`` above 2 supports penalized curvature.
         """
@@ -666,7 +679,11 @@ class SRAERegressor(RegressorMixin, _BaseSRAE):
 
     interaction_gain_threshold : float, default=4.0
         Minimum evidence gain, in nats, for a pair to be retained. This is a
-        structural setting, not a calibrated false-discovery control.
+        structural setting, not a calibrated false-discovery control. The
+        default is also calibrated against a specific tensor basis convention
+        -- a ridge on tensor B-spline coefficients is not invariant to how the
+        marginals are parametrized -- so it does not transfer to a differently
+        parametrized tensor basis. See ``docs/user_guide/interactions.rst``.
 
     max_iter : int, default=200
         Maximum number of EM iterations.
@@ -998,7 +1015,9 @@ class SRAEClassifier(ClassifierMixin, _BaseSRAE):  # noqa: D101 - see class docs
         product-correlation pre-filter engages.
 
     interaction_gain_threshold : float, default=4.0
-        Minimum evidence gain, in nats, for a pair to be retained.
+        Minimum evidence gain, in nats, for a pair to be retained. Calibrated
+        against SRAE's tensor basis convention and not transferable to a
+        differently parametrized one; see ``docs/user_guide/interactions.rst``.
 
     max_iter : int, default=200
         Maximum number of outer evidence iterations. Internally capped at 100
@@ -1021,14 +1040,23 @@ class SRAEClassifier(ClassifierMixin, _BaseSRAE):  # noqa: D101 - see class docs
     estimators_ : list of SRAEClassifier or None
         One-vs-rest sub-models for multiclass problems; ``None`` for binary.
 
-    multiclass_link : {'softmax', 'normalized_ovr'}, class attribute
-        How the one-vs-rest heads are combined into class probabilities.
-        ``'softmax'`` (default) applies a softmax to the stacked one-vs-rest
-        log-odds. ``'normalized_ovr'`` restores the pre-fix behaviour of
-        moderating each head separately and dividing by the row sum, which is
-        badly calibrated under proper scoring rules. Set it on the instance to
-        reproduce older results; it is not a constructor parameter and is not
-        returned by ``get_params``.
+    joint_ : dict or None
+        The joint multinomial Laplace fit for multiclass problems: ``beta``
+        of shape ``(K-1, n_columns)`` in the sum-to-zero contrast basis,
+        ``Sigma``, ``contrasts``, ``edf``, ``evidence``, ``history``,
+        ``n_iter``. Absent for binary fits, and ``None`` when the joint refit
+        was declined (see ``_MAX_JOINT_DIM``) or failed.
+
+    multiclass_link : {'joint', 'softmax', 'normalized_ovr'}, class attribute
+        How class probabilities are produced. ``'joint'`` (default since
+        0.0.10) predicts from the joint multinomial posterior in ``joint_``,
+        moderating toward ``1/K``. ``'softmax'`` (the 0.0.6-0.0.9 default)
+        softmaxes the stacked one-vs-rest log-odds with no moderation;
+        ``'normalized_ovr'`` (to 0.0.5) moderates each head and divides by the
+        row sum. Both legacy routes measured worse than ``'joint'`` on
+        held-out log-loss; ``'softmax'`` measured worst of the three. Set on
+        the instance to reproduce older results; not a constructor parameter
+        and not returned by ``get_params``.
 
     beta_ : ndarray of shape (n_basis,)
         Posterior mode of the stacked coefficients. Binary models only.
@@ -1120,7 +1148,7 @@ class SRAEClassifier(ClassifierMixin, _BaseSRAE):  # noqa: D101 - see class docs
 
     #: How one-vs-rest heads become class probabilities; see _multiclass_proba.
     #: 'normalized_ovr' restores the pre-2026-07 row-normalisation behaviour.
-    multiclass_link = "softmax"
+    multiclass_link = "joint"
 
     def _fit_engine(self, Z, y):
         return fit_logistic_eb(Z, y, self.specs_,
@@ -1198,8 +1226,153 @@ class SRAEClassifier(ClassifierMixin, _BaseSRAE):  # noqa: D101 - see class docs
             for c, est in zip(self.classes_, self.estimators_)
             for info in est.interactions_
         ]
-        self.evidence_ = float(sum(e.evidence_ for e in self.estimators_))
+        self._fit_joint_multinomial(Xa, y)
         return self
+
+    def _fit_joint_multinomial(self, X, y):
+        """Refit the selected structure as one joint multinomial model.
+
+        The one-vs-rest pass above discovers structure -- which blocks, which
+        interaction pairs -- and that part stays uncoupled, as documented. What
+        it cannot give is a joint posterior: independent binary fits leave the
+        cross-class blocks of the Hessian at zero, so there is no coherent
+        covariance between class surfaces and no neutral point to moderate
+        toward. This refits the union of the discovered structure under one
+        softmax likelihood, which supplies both.
+
+        Falls back to the stacked one-vs-rest route if the joint fit fails
+        numerically, so a hard problem degrades rather than raising.
+        """
+        Z = self._fit_main_blocks(X)
+        pairs, seen = [], set()
+        for info in self.interactions_:
+            if info["pair"] not in seen:
+                seen.add(info["pair"])
+                pairs.append(info["pair"])
+        chosen = []
+        for pair in pairs:
+            tb = TensorBlock(pair, levels=self._pair_levels(pair))
+            try:
+                tb.fit(X[:, pair[0]], X[:, pair[1]],
+                       self._main_design_for_pair(Z, pair))
+            except ValueError:
+                continue
+            gain = next(i["screen_gain"] for i in self.interactions_
+                        if i["pair"] == pair)
+            chosen.append((gain, pair, tb))
+        joint_interactions = self.interactions_
+        if chosen:
+            Z = self._add_interaction_blocks(X, Z, chosen)
+        self.interactions_ = joint_interactions
+
+        # Warm-start each shared precision from the one-vs-rest children. They
+        # have already located the right order of magnitude per component, and
+        # the joint EM step is far more expensive than a binary one -- its
+        # Hessian is (K-1)p square and couples every class -- so starting from
+        # 1.0 would spend most of the budget re-deriving what is already known.
+        # Geometric mean, because these are precisions spanning many decades.
+        by_name = {}
+        for est in self.estimators_:
+            for sp in getattr(est, "specs_", []):
+                by_name.setdefault(sp.name, []).append((sp.lam, sp.kap))
+        for spec in self.specs_:
+            vals = by_name.get(spec.name)
+            if not vals or isinstance(spec, _InterceptSpec):
+                continue
+            lams = np.array([v[0] for v in vals], float)
+            kaps = np.array([v[1] for v in vals], float)
+            spec.lam = float(np.exp(np.mean(np.log(np.clip(lams, 1e-300, None)))))
+            spec.kap = float(np.exp(np.mean(np.log(np.clip(kaps, 1e-300, None)))))
+
+        # The joint Hessian is ((K-1) * n_columns) square and is factorized
+        # inside every EM step, so cost grows as its cube and memory as its
+        # square. Past a few thousand it stops being a refinement and starts
+        # being the whole fit -- and can exhaust memory outright. Decline
+        # rather than degrade silently: the caller keeps a working model on the
+        # better-calibrated legacy link and is told why.
+        dim = (len(self.classes_) - 1) * Z.shape[1]
+        if dim > _MAX_JOINT_DIM:
+            warnings.warn(
+                f"skipping the joint multinomial refit: it would need a "
+                f"{dim}x{dim} Hessian, above the {_MAX_JOINT_DIM} limit "
+                f"({len(self.classes_)} classes x {Z.shape[1]} columns). "
+                f"Falling back to the one-vs-rest 'normalized_ovr' link; "
+                f"probabilities will not be moderated toward 1/K. Reduce "
+                f"n_knots, max_interactions, or the number of features to "
+                f"enable the joint fit.",
+                RuntimeWarning, stacklevel=3,
+            )
+            self._joint_ = None
+            self.evidence_ = float(sum(e.evidence_ for e in self.estimators_))
+            return
+
+        Y = (y[:, None] == self.classes_[None, :]).astype(float)
+        try:
+            fit = fit_multinomial_eb(Z, Y, self.specs_,
+                                     max_iter=min(self.max_iter, 100),
+                                     tol=self.tol, verbose=self.verbose)
+        except (np.linalg.LinAlgError, ValueError) as exc:
+            warnings.warn(
+                f"joint multinomial fit failed ({exc}); falling back to the "
+                f"stacked one-vs-rest link. Probabilities will not be "
+                f"moderated toward 1/K.",
+                RuntimeWarning, stacklevel=2,
+            )
+            self._joint_ = None
+            self.evidence_ = float(sum(e.evidence_ for e in self.estimators_))
+            return
+
+        # Deliberately does *not* overwrite beta_ / Sigma_ / edf_ / n_iter_ on
+        # the parent. Those are documented as binary-only, and the one-vs-rest
+        # children stay the per-class structural view that summary(),
+        # shape_function() and the plotting helpers report: each child carries
+        # an absolute surface per class, whereas the joint model is a contrast
+        # parametrization against a reference class and has no coefficients for
+        # it at all. Mixing the two in one report would be worse than keeping
+        # them separate. ``evidence_`` does become the joint value, since a
+        # single coherent marginal likelihood strictly beats a sum of
+        # independent ones.
+        self._joint_ = fit
+        self.joint_ = dict(
+            beta=fit["beta"], Sigma=fit["Sigma"], edf=fit["edf"],
+            evidence=fit["evidence"], history=fit["history"],
+            n_iter=fit["n_iter"], contrasts=fit["contrasts"],
+        )
+        self.evidence_ = fit["evidence"]
+
+    def _joint_logits_and_variance(self, X):
+        """Sum-to-zero class logits and the mean pairwise contrast variance.
+
+        Returns ``(Eta, vbar)`` where ``Eta`` is ``(n, K)`` and ``vbar``
+        averages ``Var(eta_k - eta_l)`` over unordered class pairs.  Averaging
+        *contrast* variances rather than per-class ones keeps the moderation
+        independent of any labelling convention, and reduces to the binary
+        posterior variance at ``K = 2``.
+        """
+        Zt = np.asarray(self._design(X), float)
+        G = self._joint_["beta"]                 # (K-1, p) contrast coefs
+        C = self._joint_["contrasts"]            # (K, K-1)
+        n_heads, p = G.shape
+        Sigma = self._joint_["Sigma"]
+        Eta = Zt @ G.T @ C.T                     # (n, K)
+
+        # g[a, b] = diag(Z Sigma_ab Z') in contrast coordinates.
+        n = Zt.shape[0]
+        g = np.empty((n_heads, n_heads, n))
+        for a in range(n_heads):
+            for b in range(a, n_heads):
+                blk = Sigma[a * p:(a + 1) * p, b * p:(b + 1) * p]
+                gab = np.einsum("ij,jk,ik->i", Zt, blk, Zt)
+                g[a, b] = gab
+                g[b, a] = gab
+        # Var(eta_k - eta_l) = (C_k - C_l)' g (C_k - C_l)
+        K = n_heads + 1
+        total = np.zeros(n)
+        for k in range(K):
+            for l in range(k + 1, K):
+                dvec = C[k] - C[l]
+                total += np.einsum("a,ab...,b->...", dvec, g, dvec)
+        return Eta, total / max(K * (K - 1) / 2, 1)
 
     @property
     def _is_multiclass(self):
@@ -1246,9 +1419,9 @@ class SRAEClassifier(ClassifierMixin, _BaseSRAE):  # noqa: D101 - see class docs
             \\nu = \\mathbf{z}^\\top \\Sigma \\mathbf{z},
 
         which shrinks predictions toward 0.5 where the model is uncertain.
-        For a multiclass fit, the default route instead applies a softmax to
-        the stacked one-vs-rest log-odds. See ``multiclass_link`` and
-        :meth:`_multiclass_proba`.
+        For a multiclass fit, the default route predicts from the joint
+        multinomial posterior and shrinks toward ``1/K`` instead. See
+        ``multiclass_link`` and :meth:`_multiclass_proba`.
 
         Parameters
         ----------
@@ -1278,41 +1451,69 @@ class SRAEClassifier(ClassifierMixin, _BaseSRAE):  # noqa: D101 - see class docs
         return np.column_stack([e.decision_function(X) for e in self.estimators_])
 
     def _multiclass_proba(self, X):
-        """Couple the one-vs-rest heads into one categorical distribution.
+        """Class probabilities from the joint multinomial posterior.
 
-        ``multiclass_link="softmax"`` (the default) maps the stacked one-vs-rest
-        log-odds through a softmax.  ``"normalized_ovr"`` restores the legacy
-        behaviour: moderate each head separately, then divide by the row sum.
+        ``multiclass_link="joint"`` (the default since 0.0.10) uses the
+        Laplace posterior of the joint model fitted by
+        :meth:`_fit_joint_multinomial`, moderating the logits toward the
+        ``K``-class neutral point ``1/K``:
 
-        The legacy route has two defects that only appear for ``K > 2``.
+        .. code-block:: text
 
-        First, the row sum is not 1 and is not close to it.  Each head answers
-        "is it class k?" on its own, so nothing makes the K answers mutually
-        consistent; measured sums range from about 0.39 to 3.56 on a 10-class
-        problem.  Dividing by that sum rescales every row by a random quantity.
+            p = softmax(eta / sqrt(1 + pi * vbar / 8))
 
-        Second, the moderation ``sigmoid(mu / sqrt(1 + pi*var/8))`` shrinks each
-        head toward 0.5, which is the correct neutral point for a binary
-        question but not for a K-class one, where it is ``1/K``.  The shrinkage
-        is also heterogeneous, since ``var`` differs per head.  Renormalising
-        afterwards cannot undo uneven shrinkage toward the wrong target.
+        with ``vbar`` the mean variance of the pairwise logit contrasts.  A
+        *common* factor per row -- rather than one per class -- is what keeps
+        this independent of which class is the reference, since adding a
+        constant to every logit leaves a softmax unchanged.  At ``K = 2`` it
+        reduces exactly to the binary moderated probability, and the joint
+        engine itself reduces to the logistic one.
 
-        Both defects vanish at ``K = 2``, where ``1/K = 0.5`` and there is only
-        one head; the binary path is unaffected and is not routed through here.
+        Two legacy routes remain, for reproducing published results:
 
-        The softmax route drops the per-head moderation rather than retargeting
-        it, so it is a corrected *link*, not a corrected posterior.  A joint
-        multinomial Laplace approximation would moderate toward ``1/K`` and is
-        the principled fix; this removes most of the error at no cost.
+        ``"softmax"`` (the 0.0.6-0.0.9 default) applies a softmax to the
+        stacked one-vs-rest log-odds.  It guarantees coherent rows but drops
+        moderation entirely, and measured on held-out synthetic multiclass data
+        it is *worse* calibrated than the route it replaced -- 2-4x the
+        expected calibration error, and higher log-loss, on 5/5 seeds at every
+        ``K`` and ``n`` tried.  Coherent row sums are not calibrated
+        probabilities.
+
+        ``"normalized_ovr"`` (to 0.0.5) moderates each head, then divides by
+        the row sum.  Its row sums genuinely are incoherent -- measured between
+        0.37 and 1.83 here, and as wide as 0.39 to 3.56 on a 10-class problem.
+        Note, though, that dividing by the row sum maps a uniform shrinkage
+        toward 0.5 onto a shrinkage toward ``1/K``, so the "wrong neutral
+        point" objection raised against it in 0.0.6 was overstated; what
+        remains is the *heterogeneity* of the per-head shrinkage.
+
+        Neither legacy route yields a joint posterior: independent binary fits
+        leave the cross-class Hessian blocks at zero, so no coherent
+        covariance between class surfaces exists to moderate with.
 
         Notes
         -----
         ``multiclass_link`` is a class attribute rather than a constructor
         parameter, so it is deliberately not part of ``get_params`` and does not
         survive :func:`sklearn.base.clone`.  It exists to reproduce results
-        published before this change, not as a quantity to tune.
+        published before these changes, not as a quantity to tune.
         """
-        if getattr(self, "multiclass_link", "softmax") == "normalized_ovr":
+        link = getattr(self, "multiclass_link", "joint")
+        if link == "joint" and getattr(self, "_joint_", None) is None:
+            # No joint fit available: the pooled and scale-integrated variants
+            # override the multiclass fit with their own machinery (edf budget,
+            # MH sampling over scales) and have no joint analogue yet, and a
+            # joint fit can fail numerically. Fall back to ``normalized_ovr``
+            # rather than ``softmax``: incoherent row sums are the lesser
+            # defect, since softmax measured worse on both log-loss and ECE.
+            link = "normalized_ovr"
+        if link == "joint":
+            Eta, vbar = self._joint_logits_and_variance(X)
+            Eta = Eta / np.sqrt(1.0 + (np.pi / 8.0) * vbar)[:, None]
+            Eta = Eta - Eta.max(axis=1, keepdims=True)      # overflow-safe
+            P = np.exp(Eta)
+            return P / P.sum(axis=1, keepdims=True)
+        if link == "normalized_ovr":
             P = np.column_stack([e.predict_proba(X)[:, 1] for e in self.estimators_])
             return P / P.sum(axis=1, keepdims=True)
         eta = np.asarray(self._multiclass_logits(X), float)
