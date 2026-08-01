@@ -33,7 +33,10 @@ pip install -e ".[test]"        # pytest suite
 pip install -e ".[benchmark]"   # notebook and comparison dependencies
 ```
 
-Requires Python 3.9+, numpy, scipy, pandas, matplotlib, and scikit-learn.
+Requires Python 3.12+, numpy 2.5+, scipy 1.18+, pandas 3.0+, matplotlib 3.11+,
+and scikit-learn 1.9+. The interpreter floor follows from the dependency floors
+— numpy 2.5 and scipy 1.18 both require Python 3.12 — not from any language
+feature SRAE uses.
 
 ## Minimal use
 
@@ -54,11 +57,14 @@ print(model.summary())
 print(model.interactions_)
 ```
 
-`SRAEClassifier` provides binary and one-vs-rest multiclass classification.
-Binary probabilities use posterior-variance moderation. By default, multiclass
-predictions apply a softmax to the independently fitted one-vs-rest log-odds;
-this couples the reported probabilities, but it does not turn estimation into
-a joint multinomial model. Validate calibration on your own data.
+`SRAEClassifier` provides binary and multiclass classification. Binary
+probabilities use posterior-variance moderation. Multiclass structure —
+which blocks, which interaction pairs — is still discovered one-vs-rest, but
+since 0.0.10 the selected structure is **refitted as a joint multinomial
+model** with a Laplace posterior, and probabilities are moderated toward the
+`K`-class neutral point `1/K`. That gives a coherent covariance between class
+surfaces, which stacked binary fits cannot. Validate calibration on your own
+data.
 
 ## Documentation
 
@@ -73,7 +79,7 @@ The project is configured for Read the Docs via `.readthedocs.yaml`. The build i
 
 Start with `docs/user_guide/` for the definitions behind each reported quantity:
 
-- `model.rst` — functional-ANOVA decomposition, P-spline blocks, Demmler–Reinsch parametrization;
+- `model.rst` — functional-ANOVA decomposition, penalized-spline blocks, the exact `∫(f'')²` roughness penalty, penalty eigenbasis;
 - `inference.rst` — the evidence objective, EM updates, Laplace approximation, effective degrees of freedom, and binary moderated probabilities;
 - `interactions.rst` — tensor purification, the screening gain, the candidate pre-filter;
 - `variants.rst` — the estimator grid and when each member is appropriate;
@@ -138,16 +144,20 @@ columns > `x0…xp`). The `feature_names` *constructor parameter* is never writt
 
 These uncertainty summaries condition on estimated hyperparameters, the selected interaction set, and the fixed basis. They do not propagate interaction-selection uncertainty.
 
-**Intervals are optimistic at small `n`.** On a well-specified Gaussian design (smooth additive truth, true `sigma^2 = 0.25`), nominal 90% predictive intervals covered:
+**Intervals are optimistic at small `n`.** On a well-specified Gaussian design (smooth additive truth, true `sigma^2 = 0.25`), nominal 90% predictive intervals covered, over 40 replicates:
 
 | `n_train` | coverage | `sigma2_` (true 0.25) |
 | --- | --- | --- |
-| 60 | 85.1% | 0.225 |
-| 100 | 87.4% | 0.237 |
-| 200 | 89.3% | 0.250 |
-| 400 | 89.8% | 0.252 |
+| 60 | 86.3% | 0.225 |
+| 100 | 88.5% | 0.238 |
+| 200 | 89.2% | 0.245 |
+| 400 | 89.7% | 0.250 |
 
-Coverage is essentially nominal by `n ≈ 200`. The shortfall is not a missing degrees-of-freedom correction — `sigma2_` already equals `RSS / (n - edf)` at the EM fixed point — but unpropagated *smoothing-parameter* uncertainty, a known limitation of empirical-Bayes GAM intervals. Integrating that scale recovers most of it: `SRAERegressorSI` reached 89.3% at `n = 100` against 87.4% for the Type-II estimator. Prefer the scale-integrated variants when calibration matters at small `n`.
+Reproduce with `python benchmarks/run_coverage_sweep.py`, which uses the same design as `TestCoverage` in the test suite.
+
+Coverage is essentially nominal by `n ≈ 200`. The shortfall is not a missing degrees-of-freedom correction — `sigma2_` already equals `RSS / (n - edf)` at the EM fixed point — but unpropagated *smoothing-parameter* uncertainty, a known limitation of empirical-Bayes GAM intervals. Integrating that scale recovers most of it: `SRAERegressorSI` reached 89.9% at `n = 100` against 88.5% for the Type-II estimator. Prefer the scale-integrated variants when calibration matters at small `n`.
+
+Because the truth here is smooth, additive and well specified, these are best-case figures — an upper bound on what to expect from correlated or misspecified real data.
 
 ## Estimator variants
 
@@ -170,24 +180,35 @@ The pooled and global-scale integration classes were developed for small-sample 
 Two properties are easy to get wrong and are worth stating here:
 
 - **`evidence_` is not comparable across variants.** On a fixed design, the pooled stack moves away from the unpooled evidence optimum. Each scale-integrated response reports a *mean log evidence* over a posterior whose prior is truncated by default to scale factors at least as regularized as the MAP; a multiclass parent sums those per-head means. Screening can also produce different fitted designs. An evidence ranking is therefore not meaningful and will often favour the plain Type-II estimator, but no universal ordering is guaranteed. Compare by held-out score only.
-- **The pooled capacity cap is aggressive.** In one historical n=80 synthetic regression run, the Type-II fit reached R^2 ~ 0.99 while the pooled fit reached ~0.53, despite both selecting the same correct interaction. Verify against the plain estimator rather than assuming the pooled variant is uniformly safer.
+- **The pooled capacity cap is aggressive.** On every dataset in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) the pooled stack scored below the plain Type-II estimator. Verify against the plain estimator rather than assuming the pooled variant is uniformly safer; it was developed for small-sample settings those datasets do not represent.
 - **SI memory is bounded.** Scale factors are stored for every retained draw (so ESS / R-hat use the full chain), but full `beta` / `Sigma` matrices are kept only for a thinned subsample of at most 128 draws. That avoids multi-GB storage when the design is large; the predictive average then uses that finite subsample (higher Monte Carlo variance than using every draw). See `_MAX_STORED_DRAWS` in `scale_integration.py`.
 
-See `docs/user_guide/variants.rst` for the mathematics of each axis. The
-bundled nine-regime measurements were generated with SRAE 0.0.5 and remain
-historical until the benchmark suite is regenerated for the current release.
+See `docs/user_guide/variants.rst` for the mathematics of each axis.
+
+Every measurement quoted in this project is reproduced by a committed script in
+`benchmarks/`: [`RESULTS.md`](benchmarks/RESULTS.md) from
+`run_benchmarks.py` (four public datasets, five-fold cross-validation, fixed
+seed, regenerated for 0.0.10), and the coverage table above from
+`run_coverage_sweep.py`. Nothing is cited that cannot be regenerated. TabPFN is
+absent from the current benchmark run: it needs a gated download and local
+weights, so the script skips it and the header records that.
 
 ## Important limitations
 
 - The model is restricted to smooth main effects and selected pairwise interactions.
 - Interaction discovery is greedy and conditional on the main-effect fit.
 - Product-correlation pre-ranking can miss interactions that are symmetric, masked, or poorly represented by a centered product.
+- `interaction_gain_threshold` remains tied to the structural settings — marginal resolution, purification, and the isotropic combination of second derivatives — even though since 0.0.8 it no longer depends on how the marginals are parametrized.
+- Conditional residual screening leaks: when a strong interaction is present, pairs sharing a feature with it score above the threshold too. The genuine pair ranks far higher, but `max_interactions` is what bounds the consequence.
 - Interaction screening has markedly less power under a Bernoulli likelihood than a Gaussian one. On a design where the planted pair is recovered at n=80 for regression, classification did not select it until roughly n=400. An empty `interactions_` on a small classification problem indicates lack of power, not absence of structure.
 - The logistic procedure is approximate; evidence monotonicity is not guaranteed by the Gaussian EM argument.
-- Multiclass heads are estimated independently with one-vs-rest Bernoulli
-  likelihoods. Their log-odds are coupled only at prediction time through the
-  default softmax (or through the explicitly selected legacy normalized-OvR
-  link), not through joint multinomial estimation.
+- Multiclass *structure* — which blocks, which interaction pairs — is still
+  discovered with independent one-vs-rest Bernoulli fits; only the refit is
+  joint. Screening is therefore uncoupled across classes.
+- The joint refit is declined above a `(K-1) × n_columns` limit of 4000, with a
+  warning, because its Hessian is that square. Such fits fall back to the
+  `normalized_ovr` link, as do the pooled and scale-integrated variants, which
+  keep their own multiclass paths.
 - The current implementation uses dense linear algebra and rejects neither sparse input nor NaN/inf explicitly — such input fails inside numpy rather than with a scikit-learn-standard error.
 - Input imputation, encoding, and leakage-safe preprocessing are external responsibilities.
 
@@ -195,18 +216,39 @@ historical until the benchmark suite is regenerated for the current release.
 
 ```text
 srae/                          core estimators, inference engines, plotting
-  blocks.py                    spline / linear / purified tensor blocks
-  inference.py                 Gaussian and logistic empirical-Bayes engines
+  blocks.py                    spline / linear / factor / purified tensor blocks,
+                               exact roughness penalties
+  inference.py                 Gaussian, logistic and joint multinomial engines
   model.py                     SRAERegressor, SRAEClassifier
   pooled.py                    pooled anti-overfitting variants
   scale_integration.py         hyperparameter-scale integration variants
   plotting.py                  shape, interaction, importance, evidence plots
 tests/                         pytest suite (API, sklearn conformance, statistical checks)
-  test_api.py                  modelling API, blocks, interactions, SI diagnostics
+  conftest.py                  estimator registry; every variant-parametrized test
+  test_api.py                  modelling API, penalties, interactions, multiclass
   test_sklearn_compat.py       estimator protocol / check_estimator pins
   test_statistical.py          coverage, null behaviour, robustness (synthetic)
+  test_metadata.py             version / license single-source-of-truth checks
+benchmarks/                    every published measurement is reproduced here
+  run_benchmarks.py            public datasets vs standard baselines
+  RESULTS.md                   its recorded output, regenerate rather than edit
+  run_coverage_sweep.py        predictive-interval coverage against sample size
 docs/                          Sphinx documentation sources
+CHANGELOG.md                   release history and behaviour changes
 ```
+
+## Changelog
+
+Release history, including behaviour changes that alter fitted results, is in
+[`CHANGELOG.md`](CHANGELOG.md). Read it before upgrading. Two recent defaults
+changed fitted results: 0.0.10 made multiclass estimation a joint multinomial
+Laplace fit, which changes every multiclass probability and `evidence_`;
+0.0.8 replaced the tensor interaction penalty with the
+surface roughness, making the screening gain independent of the marginal basis;
+0.0.7 replaced the spline roughness penalty with the exact `∫(f'')²`. Both move
+every reported `evidence_`, `edf_`, and `lam_`. 0.0.6 changed the multiclass
+probability coupling to a softmax. 0.0.9 changes no fitted quantity, but
+spline `n_coef` drops by one and `kappa` rescales.
 
 ## Testing
 
@@ -214,12 +256,22 @@ docs/                          Sphinx documentation sources
 pytest
 ```
 
-The suite parametrizes over the estimator variants across regression, binary classification, and multiclass. It covers the modelling API, reporting surface, interaction discovery, plotting, scikit-learn protocol conformance, and a synthetic statistical layer (`test_statistical.py`: interval coverage trends, null interaction rates, collinearity / heteroskedasticity / OOD clamp behaviour). Thresholds in the statistical tests are intentionally loose: they encode defensible properties, not paper-grade benchmarks. Real datasets, distribution shift, and formal FDR calibration remain external validation responsibilities.
+The suite parametrizes over the estimator variants across regression, binary classification, and multiclass. It covers the modelling API, reporting surface, interaction discovery, plotting, scikit-learn protocol conformance, and a synthetic statistical layer (`test_statistical.py`: interval coverage trends, null interaction rates, collinearity / heteroskedasticity / OOD clamp behaviour).
+
+Alongside those, one group of tests exists specifically to pin *mathematical* properties that would otherwise regress silently — each was written after a real defect was found:
+
+| Test class | Pins |
+| --- | --- |
+| `TestRoughnessPenalty` | the spline penalty equals `∫(f'')²` against quadrature; its null space is exactly the straight lines; fits are invariant to the units of `x` |
+| `TestTensorPenalty` | the tensor penalty equals its double integral; the screening gain is invariant to the marginal basis, which the pre-0.0.8 ridge was not |
+| `TestJointMultinomial` | analytic gradient and Hessian against finite differences; exact reduction to the logistic engine at `K = 2`; invariance to class relabelling |
+
+Thresholds in the statistical tests are intentionally loose: they encode defensible properties, not paper-grade benchmarks. Real datasets, distribution shift, and formal FDR calibration remain external validation responsibilities.
 
 ## Verification status
 
-- `pytest`: the full API, sklearn-compatibility, and statistical suite passes in the current Python 3.12 audit. Skips are deliberate regressor-x-classification and classifier-x-regression exclusions.
-- `sphinx-build -W`: documentation builds with zero warnings; 23 documentation doctests pass.
+- `pytest`: 559 tests pass (96 skipped) across the supported interpreter range, Python 3.12 and 3.13, against the declared dependency floors (numpy 2.5, scipy 1.18, pandas 3.0, matplotlib 3.11, scikit-learn 1.9). Both versions are audited directly, and the suite is also run from the built sdist; `.github/workflows/ci.yml` runs the whole matrix on every push and pull request. Skips are deliberate regressor-x-classification and classifier-x-regression exclusions.
+- `sphinx-build -W`: documentation builds with zero warnings; 24 documentation doctests pass.
 - `sklearn.utils.estimator_checks.check_estimator`: the parameter-handling checks — including `check_dont_overwrite_parameters` and `check_estimators_overwrite_params` — pass across all eight public estimators and are pinned by regression tests. Exact totals are intentionally not stated because scikit-learn changes its check inventory between releases.
 - Remaining `check_estimator` failures are absent input validation: sparse input, NaN/inf rejection, `NotFittedError` versus `RuntimeError`, and 1-D/2-D `y` handling. These are known gaps, not silent misbehaviour.
 

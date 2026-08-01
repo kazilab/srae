@@ -9,21 +9,32 @@ name = "srae"
 dynamic = ["version"]
 description = "Self-Regularizing Additive Estimator: evidence-screened empirical-Bayes additive models with spline main effects and pairwise interactions"
 readme = "README.md"
-requires-python = ">=3.9"
+# Forced by the runtime floors below: numpy 2.5 and scipy 1.18 both require
+# Python >= 3.12, so anything lower is unsatisfiable rather than merely untested.
+requires-python = ">=3.12"
 license = "MIT"
 authors = [{ name = "Data Analysis Team @kazilab.se", email = "srae@kazilab.se" }]
 dependencies = [
-    "numpy>=1.23",
-    "scipy>=1.10",
-    "pandas>=1.5",
-    "matplotlib>=3.6",
-    "scikit-learn>=1.2",
+    "numpy>=2.5",
+    "scipy>=1.18",
+    "pandas>=3.0",
+    "matplotlib>=3.11",
+    "scikit-learn>=1.9",
 ]
 
+[project.urls]
+Homepage = "https://www.kazilab.se/srae"
+Documentation = "https://srae.readthedocs.io"
+Source = "https://github.com/kazilab/srae"
+Changelog = "https://github.com/kazilab/srae/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
-sklearn = ["scikit-learn>=1.2"]
-test = ["pytest>=7", "scikit-learn>=1.2", "pandas>=1.5", "matplotlib>=3.6"]
-benchmark = ["scikit-learn>=1.2", "xgboost>=1.7", "jupyter", "nbformat>=5.7", "nbclient>=0.8", "pytest>=7"]
+# Floors here must not undercut the runtime floors above: a lower bound in an
+# extra cannot re-permit a version the base dependency set already excludes,
+# and letting them drift only misreports what is supported.
+sklearn = ["scikit-learn>=1.9"]
+test = ["pytest>=7", "scikit-learn>=1.9", "pandas>=3.0", "matplotlib>=3.11"]
+benchmark = ["scikit-learn>=1.9", "xgboost>=1.7", "jupyter", "nbformat>=5.7", "nbclient>=0.8", "pytest>=7"]
 
 [tool.setuptools.dynamic]
 version = { attr = "srae._metadata.VERSION" }
@@ -33,4 +44,9 @@ include = ["srae*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# -ra surfaces the skip reasons: the 96 skips are deliberate
+# regressor-x-classification exclusions, and a silent count hides the
+# difference between "not applicable" and "quietly stopped running".
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
 filterwarnings = ["ignore::DeprecationWarning"]

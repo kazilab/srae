@@ -1,0 +1,10 @@
+# Setuptools' default sdist discovery picks up tests/test_*.py but not
+# conftest.py, which every test module imports its fixtures and registries
+# from.  Without this the shipped sdist collects zero tests, so downstream
+# packagers cannot verify the build.
+include tests/conftest.py
+
+include CHANGELOG.md
+
+# Finder metadata must never reach a distribution.
+global-exclude .DS_Store
