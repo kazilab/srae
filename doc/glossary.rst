@@ -31,25 +31,32 @@ Glossary
       (:eq:`edf`).  Bounded by the block's column count.  ``edf`` near 1 means
       roughly one effective direction remains; what that direction represents
       depends on the block.  For a spline dominated by its penalty null space
-      it is trend-like, but it need not be exactly linear in raw :math:`x`.
+      it is a straight line in raw :math:`x`.
       ``edf`` near 0 indicates a component that is effectively switched off.
 
-   Demmler–Reinsch parametrization
+   penalty eigenbasis
       Rotation of a penalized block into the eigenbasis of its penalty, making
-      the prior precision matrix diagonal.  See :ref:`demmler_reinsch`.  This
-      is what gives every hyperparameter a closed-form M-step.
+      the prior precision matrix diagonal.  See :ref:`penalty_eigenbasis`.
+      This is what gives every hyperparameter a closed-form M-step.  It is
+      weaker than the Demmler–Reinsch parametrization, which also diagonalizes
+      the design inner product; SRAE does not need that and does not do it.
+
+   roughness penalty
+      :math:`\int (f'')^2\,\mathrm{d}x`, evaluated exactly on the B-spline
+      basis (:eq:`roughness`).  Replaces the plain coefficient-difference
+      penalty as of 0.0.7, which was a roughness measure only on equally
+      spaced knots and therefore not one under SRAE's quantile knots.
 
    null-space direction
       A basis direction with penalty eigenvalue :math:`s_i = 0` — unpenalized
       by the roughness penalty and governed by :math:`\kappa_j` rather than
-      :math:`\lambda_j`.  A second-order coefficient-difference penalty has a
-      two-dimensional coefficient-space null space.  Centering removes the
-      constant fitted contribution; the remaining fitted contribution is
-      trend-like, but with quantile-spaced knots it is not generally exactly
-      linear in raw :math:`x`.  In the current implementation an eigensolver
-      can represent the centered null-space contribution with collinear
-      retained columns, so interpret the fitted function and ``edf`` rather
-      than the raw null-column count.
+      :math:`\lambda_j`.  The order-2 roughness penalty has a two-dimensional
+      coefficient-space null space, the straight lines in raw :math:`x`.
+      Centering removes the constant fitted contribution; the remaining fitted
+      contribution is exactly linear in raw :math:`x` on any knot spacing, and
+      since 0.0.9 is carried by exactly one column.  A spline block therefore
+      has one null-space direction, a tensor block none — its affine null space
+      is removed by purification and dropped.
 
    penalized direction
       A basis direction with :math:`s_i > 0`, whose prior precision is
@@ -92,7 +99,8 @@ Glossary
       in the linear predictor via the probit approximation
       :math:`\operatorname{sigmoid}\big(\mu / \sqrt{1 + \pi\nu/8}\big)`
       (:eq:`moderated`), rather than plugging in the posterior mean.  The
-      default multiclass link instead applies a softmax to one-vs-rest logits.
+      multiclass analogue (:eq:`moderated_mc`) shrinks toward :math:`1/K` using
+      the mean pairwise logit-contrast variance of the joint posterior.
 
    Type-II maximum likelihood
    empirical Bayes
@@ -117,8 +125,14 @@ Glossary
 
    one-vs-rest
    OvR
-      The multiclass construction: one independent binary SRAE per class.
-      The default link couples the per-class one-vs-rest log-odds through a
-      softmax.  The legacy ``normalized_ovr`` link moderates each binary head
-      and then normalizes the rows.  Neither route is a jointly estimated
-      multinomial model, so calibration should be checked.
+      One independent binary SRAE per class.  Since 0.0.10 this is how
+      multiclass *structure* is discovered and how ``summary()``,
+      ``shape_function()`` and the plotting helpers report per-class surfaces,
+      but it is no longer how probabilities are produced.
+
+   joint multinomial refit
+      Refitting the one-vs-rest–discovered structure under a single softmax
+      likelihood, giving a Laplace posterior whose Hessian carries the
+      cross-class blocks that independent binary fits leave at zero.  Exposed
+      as ``joint_``; the source of ``predict_proba`` and, for multiclass, of
+      ``evidence_``.  See :ref:`multiclass_link`.

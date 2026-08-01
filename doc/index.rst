@@ -103,11 +103,12 @@ Scope and limitations
 - Uncertainty summaries condition on the estimated hyperparameters, the
   selected interaction set, and the fixed basis.  They do **not** propagate
   interaction-selection uncertainty.
-- Multiclass classification is one-vs-rest, not a jointly estimated
-  multinomial model.  By default, independently fitted one-vs-rest log-odds
-  are coupled through a softmax; the legacy row-normalized one-vs-rest link is
-  available only when selected explicitly.  In either case, calibration
-  should be checked.
+- Multiclass *structure* — which blocks, which interaction pairs — is
+  discovered one-vs-rest, but since 0.0.10 the selected structure is refitted
+  as a jointly estimated multinomial model and predictions come from its
+  Laplace posterior, moderated toward :math:`1/K`.  The pooled and
+  scale-integrated variants keep their own one-vs-rest paths.  Calibration
+  should still be checked on your own data.
 - The logistic path is approximate (Laplace); evidence monotonicity is not
   guaranteed by the Gaussian EM argument.
 - The implementation uses dense linear algebra and does not accept sparse

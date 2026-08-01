@@ -7,17 +7,23 @@ Installation
 Requirements
 ============
 
-SRAE requires Python 3.9 or newer and the following runtime dependencies:
+SRAE requires Python 3.12 or newer and the following runtime dependencies:
 
 ============== ==========  ====================================================
 Package        Minimum     Used for
 ============== ==========  ====================================================
-numpy          1.23        dense linear algebra, design matrices
-scipy          1.10        B-spline bases, Cholesky factorization, eigen-solves
-pandas         1.5         :meth:`~srae.SRAERegressor.summary` output
-matplotlib     3.6         the ``plot_*`` helpers
-scikit-learn   1.2         estimator protocol (``BaseEstimator``, mixins)
+numpy          2.5         dense linear algebra, design matrices
+scipy          1.18        B-spline bases, Cholesky factorization, eigen-solves
+pandas         3.0         :meth:`~srae.SRAERegressor.summary` output
+matplotlib     3.11        the ``plot_*`` helpers
+scikit-learn   1.9         estimator protocol (``BaseEstimator``, mixins)
 ============== ==========  ====================================================
+
+.. note::
+
+   The Python floor follows from the dependency floors rather than from any
+   language feature SRAE uses: numpy 2.5 and scipy 1.18 both require Python
+   3.12, so an install on an earlier interpreter cannot resolve at all.
 
 scikit-learn is a hard requirement: the estimators inherit from
 :class:`sklearn.base.BaseEstimator` so that :func:`sklearn.base.clone`,

@@ -1,9 +1,10 @@
 sphinx>=7.0
 numpydoc>=1.6
 sphinx-rtd-theme>=2.0
-# runtime deps needed for autodoc to import srae
-numpy>=1.23
-scipy>=1.10
-pandas>=1.5
-matplotlib>=3.6
-scikit-learn>=1.2
+# runtime deps needed for autodoc to import srae -- keep in step with the
+# floors in pyproject.toml
+numpy>=2.5
+scipy>=1.18
+pandas>=3.0
+matplotlib>=3.11
+scikit-learn>=1.9

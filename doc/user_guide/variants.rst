@@ -275,37 +275,39 @@ Choosing a variant
 
    Compare variants by held-out predictive score only.
 
-Measured behaviour on synthetic data
-------------------------------------
+Measured behaviour
+------------------
+
+The only measurements this project stands behind are the ones a committed
+script reproduces: ``benchmarks/RESULTS.md``, regenerated with
+``python benchmarks/run_benchmarks.py``.  Four public datasets, five-fold
+cross-validation, fixed seed.  Two patterns in it bear on the choice of
+variant.
+
+**The pooled stack costs accuracy on these datasets.**  It was behind the
+plain Type-II estimator on every one — in :math:`R^2` for regression and in
+held-out log-loss for classification.  Its capacity cap is deliberately
+aggressive, so verify against :class:`~srae.SRAERegressor` /
+:class:`~srae.SRAEClassifier` rather than assuming the pooled variant is
+uniformly safer.  It was developed for small-sample settings that these four
+datasets do not represent.
+
+**Scale integration mostly buys calibration, not accuracy.**  ``SI`` tracked
+the Type-II point estimate closely on regression :math:`R^2` while reporting
+interval coverage marginally closer to nominal, and improved held-out log-loss
+on both classification datasets — on the three-class problem substantially,
+though with slightly lower accuracy.  That is the trade it is designed for:
+integrating the hyperparameter scale widens intervals where the point estimate
+was overconfident.
 
 .. warning::
 
-   The bundled benchmark results summarized below were recorded for SRAE
-   0.0.5.  They have not been regenerated for 0.0.6, whose default multiclass
-   coupling changed to softmax.  Treat the classification findings as
-   historical until the benchmark suite is rerun.
-
-On smooth additive designs with i.i.d. Gaussian inputs, across nine recorded
-regimes
-(regression and classification, :math:`n` from 50 to 400, :math:`p` from 8 to
-60), held-out log-likelihood favoured ``SI`` over the corresponding point
-estimate in essentially every regime, while the pooled axis was
-regime-dependent and **not** monotone in :math:`p/n` — pooled helped at
-:math:`n{=}50, p{=}40`, but hurt at :math:`n{=}80, p{=}60`.
-
-A second effect is worth anticipating: the pooled stack's edf budget and
-holdout calibration shrink hard at small :math:`n`.  On one :math:`n = 80`
-regression design the Type-II fit reached :math:`R^2 \approx 0.99` while the
-pooled fit reached :math:`\approx 0.53`, *despite both selecting the same
-correct interaction*.
-
-.. warning::
-
-   These are synthetic i.i.d. Gaussian designs with a well-specified smooth
-   additive truth — favourable to SRAE and unlike correlated, high-dimensional
-   real data such as spectra.  Treat them as orientation, not as a
-   recommendation transferable to your problem.  Validate on your own held-out
-   data.
+   Four datasets are not a benchmark suite.  They are public, low-dimensional
+   and largely well-behaved — unlike correlated, high-dimensional real data
+   such as spectra — and the baselines run at library defaults with no tuning,
+   which flatters SRAE since it tunes its own shrinkage internally.  Treat this
+   as orientation, not as a recommendation transferable to your problem, and
+   validate on your own held-out data.
 
 Practical guidance
 ------------------

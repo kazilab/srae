@@ -53,9 +53,8 @@ same edf does not imply the same shape for every block:
      - Reading
    * - spline: large :math:`\lambda`, moderate :math:`\kappa`
      - :math:`\approx 1`
-     - Penalized curvature is suppressed; the retained contribution is
-       low-dimensional and trend-like, but not necessarily exactly linear in
-       raw :math:`x`.
+     - Penalized curvature is suppressed; the retained contribution is a
+       straight line in raw :math:`x`.
    * - all applicable precisions large
      - :math:`\approx 0`
      - The component has been **switched off**.
@@ -153,9 +152,13 @@ trace is weaker evidence of stability: irrelevant ARD directions can still
 crawl toward the precision bound after the evidence has levelled (see
 :ref:`gaussian_evidence`).
 
-A multiclass parent exposes ``evidence_`` as the sum across one-vs-rest
-sub-models, but does not expose a combined ``evidence_history_``.  Plot or
-inspect the trace of an individual object in ``estimators_`` instead.
+A multiclass parent exposes ``evidence_`` from the joint multinomial refit
+(:ref:`multiclass_link`) — a single marginal likelihood for the observed
+labels.  Before 0.0.10 it was the *sum* of the one-vs-rest evidences, which was
+not a marginal likelihood at all: summing :math:`K` binary evidences scores the
+same data :math:`K` times.  The two are therefore not comparable across
+versions.  The joint iteration trace is in ``joint_['history']``; per-class
+traces stay on the objects in ``estimators_``.
 
 .. warning::
 

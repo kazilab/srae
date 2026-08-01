@@ -185,10 +185,9 @@ the block-restricted trace of :math:`\mathbf{I} - \mathbf{A}\boldsymbol{\Sigma}`
 It is bounded by the number of columns in the block and decreases toward zero
 as shrinkage tightens.  An :math:`\operatorname{edf}` near 1 means roughly one
 effective direction remains, not universally that the component is a straight
-line.  For a spline dominated by its penalty null space, that direction is
-trend-like (and need not be exactly linear in raw :math:`x` with
-quantile-spaced knots); for factor and tensor blocks it has a different
-interpretation.  An :math:`\operatorname{edf}` near 0 means the component has
+line.  For a spline dominated by its penalty null space, that direction *is* a
+straight line in raw :math:`x` — exactly so since 0.0.7, on any knot spacing;
+for factor and tensor blocks it has a different interpretation.  An :math:`\operatorname{edf}` near 0 means the component has
 effectively been removed.
 
 Total capacity :math:`\sum_j \operatorname{edf}_j` is what the pooled variants
@@ -220,12 +219,50 @@ which is what :meth:`~srae.SRAEClassifier.predict_proba` returns for a binary
 fit.  The denominator shrinks predictions toward :math:`0.5` exactly where the
 model is least certain.  This is MacKay's moderated output [4]_.
 
-For multiclass fits, the default ``multiclass_link="softmax"`` instead applies
-a softmax to the independently fitted one-vs-rest log-odds.  It does not apply
-the binary moderation formula to each head.  The legacy
-``multiclass_link="normalized_ovr"`` route does moderate each head before row
-normalization.  The scale-integrated multiclass classifier preserves its scale
-uncertainty by softmaxing paired posterior logit draws and averaging the
+.. _multiclass_link:
+
+Multiclass probabilities
+------------------------
+
+Since 0.0.10 the default ``multiclass_link="joint"`` refits the structure
+discovered one-vs-rest as a **joint multinomial model** and predicts from its
+Laplace posterior, moderating toward the :math:`K`-class neutral point:
+
+.. math::
+   :label: moderated_mc
+
+   \mathbf{p} \;=\; \operatorname{softmax}\!\left(
+      \frac{\boldsymbol{\eta}}{\sqrt{1 + \pi\bar{\nu}/8}}
+   \right),
+   \qquad
+   \bar{\nu} \;=\; \operatorname*{mean}_{k<l}
+      \operatorname{Var}\!\left(\eta_k - \eta_l\right),
+
+with the class logits carried in a sum-to-zero contrast basis.  A *common*
+factor per row, rather than one per class, is what keeps the link independent
+of class labelling: adding a constant to every logit leaves a softmax
+unchanged.  At :math:`K = 2` both :eq:`moderated_mc` and the joint engine
+reduce exactly to their binary counterparts.
+
+Two legacy routes remain, for reproducing published results.
+``multiclass_link="softmax"`` (the 0.0.6-0.0.9 default) softmaxes the
+one-vs-rest log-odds with no moderation; ``"normalized_ovr"`` (to 0.0.5)
+moderates each head and divides by the row sum.
+
+.. warning::
+
+   Coherent row sums are not calibrated probabilities.  Measured held-out on
+   synthetic multiclass data over five seeds, the ``softmax`` route is the
+   *worst* of the three — 2-4 times the expected calibration error of
+   ``normalized_ovr``, and higher log-loss, at every :math:`K` and :math:`n`
+   tried.  Neither one-vs-rest route yields a joint posterior: independent
+   binary fits leave the cross-class Hessian blocks at zero, so no coherent
+   covariance between class surfaces exists to moderate with.
+
+The pooled and scale-integrated variants override the multiclass fit with
+machinery that has no joint analogue yet, so they fall back to
+``normalized_ovr``.  The scale-integrated classifier instead preserves its
+scale uncertainty by softmaxing paired posterior logit draws and averaging the
 resulting probability vectors.
 
 Predictive distribution for regression
